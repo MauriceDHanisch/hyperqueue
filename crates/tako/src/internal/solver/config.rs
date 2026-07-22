@@ -48,8 +48,24 @@ pub(crate) fn mip_time_limit() -> Duration {
     get_duration_from_env("HQ_SCHEDULER_MIP_TIME_LIMIT_MS").unwrap_or(default)
 }
 
+/// Number of threads HiGHS may use internally for one solve. Both solve()
+/// and solve_bounded() run MILPs this code's own docs call tiny -- no
+/// solve-quality benefit to internal parallelism here. Left unset, HiGHS's
+/// own heuristic auto-detects all visible cores and can burst-spawn far
+/// more native OS threads than a solve this size needs; on a host with a
+/// low max-user-processes ulimit that burst can exceed the limit, throwing
+/// an uncaught C++ exception across the FFI boundary that calls
+/// std::terminate() and kills the whole hq server process outright.
+pub(crate) fn mip_threads() -> i32 {
+    get_i32_from_env("HQ_SCHEDULER_MIP_THREADS").unwrap_or(1)
+}
+
 fn get_f64_from_env(key: &str) -> Option<f64> {
     std::env::var(key).ok().and_then(|value| value.parse::<f64>().ok())
+}
+
+fn get_i32_from_env(key: &str) -> Option<i32> {
+    std::env::var(key).ok().and_then(|value| value.parse::<i32>().ok())
 }
 
 fn get_duration_from_env(key: &str) -> Option<Duration> {

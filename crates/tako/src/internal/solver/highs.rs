@@ -1,4 +1,4 @@
-use crate::internal::solver::config::{mip_rel_gap, mip_time_limit};
+use crate::internal::solver::config::{mip_rel_gap, mip_threads, mip_time_limit};
 use crate::internal::solver::{ConstraintType, LpInnerSolver, LpSolution};
 use highs::{HighsModelStatus, HighsSolutionStatus, Sense};
 
@@ -49,7 +49,9 @@ impl LpInnerSolver for HighsSolver {
     /// LPs are tiny (single-worker resource groups), so there is no
     /// scheduler-scale performance problem to trade off here.
     fn solve(self) -> Option<(Self::Solution, f64)> {
-        let solved_model = self.0.optimise(Sense::Maximise).solve();
+        let mut model = self.0.optimise(Sense::Maximise);
+        model.set_option("threads", mip_threads());
+        let solved_model = model.solve();
         if !matches!(solved_model.status(), HighsModelStatus::Optimal) {
             return None;
         }
@@ -70,6 +72,7 @@ impl LpInnerSolver for HighsSolver {
         let mut model = self.0.optimise(Sense::Maximise);
         model.set_option("time_limit", mip_time_limit().as_secs_f64());
         model.set_option("mip_rel_gap", mip_rel_gap());
+        model.set_option("threads", mip_threads());
         let solved_model = model.solve();
 
         match solved_model.status() {
