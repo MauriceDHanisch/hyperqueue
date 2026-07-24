@@ -24,7 +24,7 @@ use anyhow::Context;
 use futures::future::join_all;
 use std::future::Future;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tako::WorkerId;
 use tako::control::{ServerRef, WorkerTypeQuery};
 use tako::resources::ResourceDescriptor;
@@ -940,6 +940,18 @@ enum AllocationSyncReason {
     AllocationExternalChange(AllocationExternalStatus),
 }
 
+/// How long a `Finished` allocation stays willing to accept a reconnecting worker before its
+/// quick disconnect is treated as final. Sized comfortably above the worker's own registration
+/// retry budget (`connect_and_register_with_retry`: up to 8 attempts, 10s apart) so a legitimate
+/// retry isn't discarded as belonging to an allocation that has already moved on.
+///
+/// Vista-specific: this reopening behavior is gated to aarch64 (Vista is currently this fork's
+/// only aarch64 site) below, alongside the match arm that uses it -- observed repeatedly in
+/// mg-gsf-vista's own server.log (a worker registers, disconnects ~15s later matching the
+/// registration timeout, an immediate same-allocation reconnect gets discarded, and the node
+/// then sits idle for hours), with no equivalent evidence from this fork's x86 sites.
+const WORKER_RECONNECT_GRACE_PERIOD: Duration = Duration::from_secs(120);
+
 /// Update the status of an allocation once an interesting event (`sync_reason`) has happened.
 fn sync_allocation_status(
     events: &EventStreamer,
@@ -988,6 +1000,41 @@ fn sync_allocation_status(
                             "Allocation {allocation_id} already had worker {worker_id} connected"
                         );
                     }
+                    None
+                }
+                AllocationState::Finished {
+                    started_at,
+                    finished_at,
+                    disconnected_workers,
+                } if cfg!(target_arch = "aarch64")
+                    && disconnected_workers.all_crashed()
+                    && finished_at
+                        .inner()
+                        .elapsed()
+                        .is_ok_and(|elapsed| elapsed <= WORKER_RECONNECT_GRACE_PERIOD) =>
+                {
+                    // The worker's own registration wait (connect_and_register, up to 15s) can
+                    // expire if the server was too busy (e.g. mid scheduler solve, or a burst of
+                    // other workers registering) to flush the response in time. The worker then
+                    // drops the connection and retries on its own (connect_and_register_with_retry:
+                    // up to 8 attempts, 10s apart). Server-side this looked identical to a crash
+                    // (all_crashed() is exactly this "disconnected very soon after connecting"
+                    // heuristic), so the allocation was finalized as Finished immediately -- and
+                    // since it no longer expected new workers, the retry's successful reconnection
+                    // used to be silently discarded, wasting the whole node for the rest of its
+                    // walltime. Reopen instead, as long as we're still within the worker's own
+                    // retry budget.
+                    log::info!(
+                        "Worker {worker_id} reconnected to allocation {allocation_id} within the \
+                         registration-retry grace window; reopening it instead of discarding the \
+                         connection as belonging to an already-finished allocation."
+                    );
+                    allocation.status = AllocationState::Running {
+                        connected_workers: Set::from_iter([worker_id]),
+                        disconnected_workers: Default::default(),
+                        started_at: *started_at,
+                        status_error_count: 0,
+                    };
                     None
                 }
                 AllocationState::Finished { .. } | AllocationState::FinishedUnexpectedly { .. } => {
@@ -1752,6 +1799,131 @@ mod tests {
                 .await;
             ctx.stop_worker(w0, lost_worker_normal(LostWorkerReason::ConnectionLost))
                 .await;
+            ctx.check_finished_workers(
+                &ctx.get_allocations(queue_id)[0],
+                vec![(w0, LostWorkerReason::ConnectionLost)],
+            );
+        })
+        .await;
+    }
+
+    // Vista-only fix (see WORKER_RECONNECT_GRACE_PERIOD's doc comment) -- this test only holds
+    // on the aarch64 build where the reopening match arm is active. See
+    // quick_reconnect_still_discarded_on_non_vista_arch below for the x86 counterpart, which
+    // locks in that this is a deliberate no-op there, not an oversight.
+    #[cfg(target_arch = "aarch64")]
+    #[tokio::test]
+    async fn reopen_finished_allocation_on_quick_reconnect() {
+        run_test(async |mut ctx: TestCtx| {
+            let queue_id = ctx
+                .add_queue(
+                    always_queued_handler(),
+                    QueueBuilder::default().backlog(1).max_workers_per_alloc(1),
+                )
+                .await;
+
+            let rq_id = ctx.default_rq_id();
+            ctx.create_simple_tasks(100, rq_id).await;
+            ctx.try_submit().await;
+
+            let allocation_id = ctx.get_allocations(queue_id)[0].id.clone();
+            let w0 = ctx
+                .start_worker(WorkerConfigBuilder::default(), allocation_id.as_str())
+                .await;
+            // A quick ConnectionLost (short lifetime) looks like the worker's own
+            // registration-race retry (connect_and_register_with_retry), not a genuine crash.
+            ctx.stop_worker(w0, lost_worker_quick(LostWorkerReason::ConnectionLost))
+                .await;
+            ctx.check_finished_workers(
+                &ctx.get_allocations(queue_id)[0],
+                vec![(w0, LostWorkerReason::ConnectionLost)],
+            );
+
+            // The worker's own retry reconnects from the same allocation shortly after.
+            let w1 = ctx
+                .start_worker(WorkerConfigBuilder::default(), allocation_id.as_str())
+                .await;
+
+            // The allocation should have reopened to accept it instead of discarding the
+            // reconnection as belonging to an already-finished allocation.
+            ctx.check_running_workers(&ctx.get_allocations(queue_id)[0], vec![w1]);
+        })
+        .await;
+    }
+
+    // Non-Vista counterpart of reopen_finished_allocation_on_quick_reconnect above: on every
+    // arch other than aarch64, the reopening match arm is compiled out, so the exact same quick
+    // reconnect that gets accepted on Vista is expected to still be discarded here, byte-for-byte
+    // matching this fork's pre-fix (and upstream) behavior.
+    #[cfg(not(target_arch = "aarch64"))]
+    #[tokio::test]
+    async fn quick_reconnect_still_discarded_on_non_vista_arch() {
+        run_test(async |mut ctx: TestCtx| {
+            let queue_id = ctx
+                .add_queue(
+                    always_queued_handler(),
+                    QueueBuilder::default().backlog(1).max_workers_per_alloc(1),
+                )
+                .await;
+
+            let rq_id = ctx.default_rq_id();
+            ctx.create_simple_tasks(100, rq_id).await;
+            ctx.try_submit().await;
+
+            let allocation_id = ctx.get_allocations(queue_id)[0].id.clone();
+            let w0 = ctx
+                .start_worker(WorkerConfigBuilder::default(), allocation_id.as_str())
+                .await;
+            ctx.stop_worker(w0, lost_worker_quick(LostWorkerReason::ConnectionLost))
+                .await;
+            ctx.check_finished_workers(
+                &ctx.get_allocations(queue_id)[0],
+                vec![(w0, LostWorkerReason::ConnectionLost)],
+            );
+
+            let _w1 = ctx
+                .start_worker(WorkerConfigBuilder::default(), allocation_id.as_str())
+                .await;
+
+            // No reopening here: the late reconnect is discarded, allocation stays Finished
+            // with only w0 recorded, exactly as it would with the fix absent entirely.
+            ctx.check_finished_workers(
+                &ctx.get_allocations(queue_id)[0],
+                vec![(w0, LostWorkerReason::ConnectionLost)],
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn do_not_reopen_finished_allocation_after_genuine_disconnect() {
+        run_test(async |mut ctx: TestCtx| {
+            let queue_id = ctx
+                .add_queue(
+                    always_queued_handler(),
+                    QueueBuilder::default().backlog(1).max_workers_per_alloc(1),
+                )
+                .await;
+
+            let rq_id = ctx.default_rq_id();
+            ctx.create_simple_tasks(100, rq_id).await;
+            ctx.try_submit().await;
+
+            let allocation_id = ctx.get_allocations(queue_id)[0].id.clone();
+            let w0 = ctx
+                .start_worker(WorkerConfigBuilder::default(), allocation_id.as_str())
+                .await;
+            // A long lifetime means this was a real disconnect after doing work, not the
+            // registration-race pattern -- the allocation should stay finished for good.
+            ctx.stop_worker(w0, lost_worker_normal(LostWorkerReason::ConnectionLost))
+                .await;
+
+            let _w1 = ctx
+                .start_worker(WorkerConfigBuilder::default(), allocation_id.as_str())
+                .await;
+
+            // The late worker is discarded; the allocation remains Finished with only w0
+            // recorded, exactly as before this fix.
             ctx.check_finished_workers(
                 &ctx.get_allocations(queue_id)[0],
                 vec![(w0, LostWorkerReason::ConnectionLost)],
