@@ -1,4 +1,6 @@
-use crate::internal::solver::config::{mip_rel_gap, mip_threads, mip_time_limit};
+#[cfg(target_arch = "aarch64")]
+use crate::internal::solver::config::mip_threads;
+use crate::internal::solver::config::{mip_rel_gap, mip_time_limit};
 use crate::internal::solver::{ConstraintType, LpInnerSolver, LpSolution};
 use highs::{HighsModelStatus, HighsSolutionStatus, Sense};
 
@@ -49,7 +51,12 @@ impl LpInnerSolver for HighsSolver {
     /// LPs are tiny (single-worker resource groups), so there is no
     /// scheduler-scale performance problem to trade off here.
     fn solve(self) -> Option<(Self::Solution, f64)> {
+        #[allow(unused_mut)] // only mutated on the Vista-only threads-pinning branch below
         let mut model = self.0.optimise(Sense::Maximise);
+        // Vista-only (see mip_threads' doc comment): pinning HiGHS's thread count is a
+        // fix for a ulimit-triggered crash specific to that site's login node. Other
+        // sites' builds keep HiGHS's own default (unset/auto) untouched.
+        #[cfg(target_arch = "aarch64")]
         model.set_option("threads", mip_threads());
         let solved_model = model.solve();
         if !matches!(solved_model.status(), HighsModelStatus::Optimal) {
@@ -72,6 +79,7 @@ impl LpInnerSolver for HighsSolver {
         let mut model = self.0.optimise(Sense::Maximise);
         model.set_option("time_limit", mip_time_limit().as_secs_f64());
         model.set_option("mip_rel_gap", mip_rel_gap());
+        #[cfg(target_arch = "aarch64")]
         model.set_option("threads", mip_threads());
         let solved_model = model.solve();
 
