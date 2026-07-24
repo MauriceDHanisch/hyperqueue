@@ -24,7 +24,8 @@ use crate::internal::server::reactor::{
 };
 use crate::internal::server::worker::{DEFAULT_WORKER_OVERVIEW_INTERVAL, Worker};
 use crate::internal::transfer::auth::{
-    do_authentication, forward_queue_to_sealed_sink, open_message, serialize,
+    do_authentication, forward_queue_to_sealed_sink, open_message, read_reassembled_message,
+    serialize,
 };
 use crate::internal::transfer::transport::make_protocol_builder;
 use crate::internal::worker::configuration::sync_worker_configuration;
@@ -85,12 +86,13 @@ pub(crate) async fn worker_authentication(
     let secret_key = core_ref.get().secret_key().cloned();
     let (sealer, mut opener) =
         do_authentication(0, "server", "worker", secret_key, &mut writer, &mut reader).await?;
-    let message_data = timeout(Duration::from_secs(15), reader.next())
+    let message_data = timeout(Duration::from_secs(15), read_reassembled_message(&mut reader))
         .await
         .map_err(|_| "Worker registration did not arrive")?
+        .map_err(DsError::from)?
         .ok_or_else(|| {
             DsError::from("The remote side closed connection without worker registration")
-        })??;
+        })?;
 
     let message: ConnectionRegistration = open_message(&mut opener, &message_data)?;
 
@@ -289,8 +291,8 @@ pub(crate) async fn worker_receive_loop<
     mut receiver: Reader,
     mut opener: Option<StreamOpener>,
 ) -> crate::Result<Option<WorkerStopReason>> {
-    while let Some(message) = receiver.next().await {
-        let message: FromWorkerMessage = open_message(&mut opener, &message?)?;
+    while let Some(message) = read_reassembled_message(&mut receiver).await? {
+        let message: FromWorkerMessage = open_message(&mut opener, &message)?;
         let mut core = core_ref.get_mut();
         let mut comm = comm_ref.get_mut();
         match message {

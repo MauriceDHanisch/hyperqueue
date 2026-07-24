@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bincode::{DefaultOptions, Options};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures::Stream;
 use futures::StreamExt;
 use futures::stream::{SplitSink, SplitStream};
 use futures::{Sink, SinkExt};
@@ -16,6 +17,39 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+/// Maximum amount of actual message data placed in a single wire frame (i.e. a
+/// single write to the underlying TCP socket). Vista's network path between login
+/// and `gg`-partition compute nodes silently and permanently black-holes a TCP
+/// connection the moment a single write needs more than one TCP segment (observed
+/// threshold: writes up to ~1460 bytes -- the standard MSS for a 1500-byte-MTU path
+/// -- always succeed; anything larger fails 100% of the time and kills the
+/// connection outright, with no further data ever delivered in either direction).
+/// Splitting any larger message into several sends of at most this size, each
+/// safely fitting in one segment with margin to spare, avoids the black hole
+/// entirely. See CHUNK_CONTINUES/CHUNK_FINAL below for the wire format.
+///
+/// Vista-specific: not observed on this fork's x86 sites, and gated to aarch64
+/// (Vista is currently the only aarch64 deployment) -- see send_chunked/
+/// read_reassembled_message, the only place this is used.
+#[cfg(target_arch = "aarch64")]
+const MAX_WIRE_CHUNK_PAYLOAD: usize = 1200;
+
+/// Prefix byte on every wire frame: CHUNK_FINAL means this frame completes the
+/// logical message (the message may consist of just this one frame); CHUNK_CONTINUES
+/// means more frames follow before the logical message is complete.
+#[cfg(target_arch = "aarch64")]
+const CHUNK_CONTINUES: u8 = 1;
+#[cfg(target_arch = "aarch64")]
+const CHUNK_FINAL: u8 = 0;
+
+/// Real (not just scheduler-yield) pause between consecutive chunks of the
+/// same oversized message, so the kernel/NIC has a chance to actually
+/// transmit each chunk as its own packet before the next is queued -- see the
+/// comment at its use site in send_chunked for why this is necessary even
+/// though each chunk is already sized to fit in one TCP segment on its own.
+#[cfg(target_arch = "aarch64")]
+const CHUNK_SEND_DELAY: Duration = Duration::from_millis(2);
 
 use crate::internal::common::error::DsError;
 use crate::internal::messages::auth::{
@@ -292,12 +326,108 @@ pub async fn forward_queue_to_sealed_sink<E, S: Sink<Bytes, Error = E> + Unpin>(
     mut sealer: Option<StreamSealer>,
 ) -> Result<(), E> {
     while let Some(data) = queue.recv().await {
-        if let Err(e) = sink.send(seal_message(&mut sealer, data)).await {
+        let sealed = seal_message(&mut sealer, data);
+        if let Err(e) = send_chunked(&mut sink, sealed).await {
             log::debug!("Forwarding from queue failed");
             return Err(e);
         }
     }
     Ok(())
+}
+
+/// Sends `data` as one or more wire frames, each carrying at most
+/// `MAX_WIRE_CHUNK_PAYLOAD` bytes of the message so no single write ever needs
+/// more than one TCP segment on a standard-MTU path (see MAX_WIRE_CHUNK_PAYLOAD).
+///
+/// Vista-only; every other site's build takes the plain, unchunked send below,
+/// byte-identical to this fork's pre-chunking wire format.
+#[cfg(target_arch = "aarch64")]
+pub async fn send_chunked<E, S: Sink<Bytes, Error = E> + Unpin>(
+    sink: &mut S,
+    data: Bytes,
+) -> Result<(), E> {
+    if data.len() <= MAX_WIRE_CHUNK_PAYLOAD {
+        let mut frame = BytesMut::with_capacity(data.len() + 1);
+        frame.extend_from_slice(&[CHUNK_FINAL]);
+        frame.extend_from_slice(&data);
+        return sink.send(frame.freeze()).await;
+    }
+    let mut offset = 0;
+    while offset < data.len() {
+        let end = (offset + MAX_WIRE_CHUNK_PAYLOAD).min(data.len());
+        let is_last = end == data.len();
+        let mut frame = BytesMut::with_capacity(end - offset + 1);
+        frame.extend_from_slice(&[if is_last { CHUNK_FINAL } else { CHUNK_CONTINUES }]);
+        frame.extend_from_slice(&data[offset..end]);
+        sink.send(frame.freeze()).await?;
+        offset = end;
+        if offset < data.len() {
+            // Without a real pause here, many chunks queued back-to-back can be
+            // recombined by the kernel/NIC (TCP segmentation offload) into fewer,
+            // larger on-wire packets that exceed the safe single-segment size
+            // again, defeating the whole point of chunking. A short sleep gives
+            // the previous chunk time to actually leave the NIC as its own
+            // packet before the next one is queued.
+            tokio::time::sleep(CHUNK_SEND_DELAY).await;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub async fn send_chunked<E, S: Sink<Bytes, Error = E> + Unpin>(
+    sink: &mut S,
+    data: Bytes,
+) -> Result<(), E> {
+    sink.send(data).await
+}
+
+/// Reads wire frames from `stream` and reassembles them into one complete
+/// logical message, transparently undoing the chunking done by `send_chunked`.
+/// Returns `Ok(None)` if the stream ended before any (partial) message data
+/// was read, matching the behavior of `stream.next()` at end-of-stream.
+///
+/// Vista-only; every other site's build takes the plain passthrough below, which
+/// reads exactly one frame per message, matching this fork's pre-chunking behavior.
+#[cfg(target_arch = "aarch64")]
+pub async fn read_reassembled_message<S>(
+    stream: &mut S,
+) -> Result<Option<BytesMut>, std::io::Error>
+where
+    S: Stream<Item = Result<BytesMut, std::io::Error>> + Unpin,
+{
+    let mut accumulated: Option<BytesMut> = None;
+    loop {
+        let Some(frame) = stream.next().await else {
+            return Ok(None);
+        };
+        let mut frame = frame?;
+        if frame.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "received an empty chunked-message frame (missing continuation marker)",
+            ));
+        }
+        let marker = frame.split_to(1)[0];
+        match accumulated.as_mut() {
+            Some(buf) => buf.unsplit(frame),
+            None => accumulated = Some(frame),
+        }
+        if marker == CHUNK_FINAL {
+            return Ok(accumulated);
+        }
+        // marker == CHUNK_CONTINUES: loop to read the next frame of this message.
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub async fn read_reassembled_message<S>(
+    stream: &mut S,
+) -> Result<Option<BytesMut>, std::io::Error>
+where
+    S: Stream<Item = Result<BytesMut, std::io::Error>> + Unpin,
+{
+    stream.next().await.transpose()
 }
 
 #[cfg(test)]

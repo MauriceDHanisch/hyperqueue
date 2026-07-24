@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use futures::{SinkExt, Stream, StreamExt};
+use futures::{Stream, StreamExt};
 use orion::aead::SecretKey;
 use orion::aead::streaming::StreamOpener;
 use tokio::net::{TcpListener, TcpStream};
@@ -24,7 +24,8 @@ use crate::internal::messages::worker::{
 };
 use crate::internal::server::rpc::ConnectionDescriptor;
 use crate::internal::transfer::auth::{
-    do_authentication, forward_queue_to_sealed_sink, open_message, seal_message, serialize,
+    do_authentication, forward_queue_to_sealed_sink, open_message, read_reassembled_message,
+    seal_message, send_chunked, serialize,
 };
 use crate::internal::transfer::transport::make_protocol_builder;
 use crate::internal::worker::comm::WorkerComm;
@@ -101,6 +102,11 @@ pub async fn connect_to_server_and_authenticate(
 // against.
 const REGISTRATION_MAX_ATTEMPTS: u32 = 8;
 const REGISTRATION_RETRY_DELAY: Duration = Duration::from_secs(10);
+// A busy server can legitimately take several seconds to flush a queued response (e.g. a single
+// scheduler solve is bounded at up to 5s, and a burst of registrations can stack a few of those
+// back-to-back). 15s left very little margin above that; 120s comfortably covers it without
+// meaningfully delaying detection of an actually-dead server.
+const REGISTRATION_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
 async fn connect_and_register(
     scheduler_addresses: &[SocketAddr],
@@ -119,18 +125,23 @@ async fn connect_and_register(
         configuration: configuration.clone(),
     });
     let data = serialize(&message)?.into();
-    sender.send(seal_message(&mut sealer, data)).await?;
+    send_chunked(&mut sender, seal_message(&mut sealer, data)).await?;
 
-    let response = timeout(Duration::from_secs(15), receiver.next())
+    // The registration response includes the full list of already-connected
+    // workers, so it can grow well past one TCP segment's worth of data on a
+    // large or busy cluster -- must be read via the same reassembly logic
+    // that undoes send_chunked's chunking, not a raw single-frame read.
+    let response = timeout(REGISTRATION_RESPONSE_TIMEOUT, read_reassembled_message(&mut receiver))
         .await
         .map_err(|_| {
             crate::Error::GenericError("Did not receive worker registration response".into())
         })?
+        .map_err(crate::Error::from)?
         .ok_or_else(|| {
             crate::Error::GenericError(
                 "Connection closed without receiving registration response".into(),
             )
-        })??;
+        })?;
     let response: WorkerRegistrationResponse = open_message(&mut opener, &response)?;
 
     Ok((
@@ -478,8 +489,7 @@ async fn worker_message_loop(
     mut stream: impl Stream<Item = Result<BytesMut, std::io::Error>> + Unpin,
     mut opener: Option<StreamOpener>,
 ) -> crate::Result<()> {
-    while let Some(data) = stream.next().await {
-        let data = data?;
+    while let Some(data) = read_reassembled_message(&mut stream).await? {
         let message: ToWorkerMessage = open_message(&mut opener, &data)?;
         let mut state = state_ref.get_mut();
         if process_worker_message(&mut state, message) {
